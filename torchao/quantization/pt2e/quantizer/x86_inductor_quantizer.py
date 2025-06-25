@@ -90,6 +90,7 @@ default_quantizable_ops = propagation_quantizable_ops | {
     torch.ops.aten.conv2d.default,
     torch.ops.aten.linear.default,
     torch.ops.aten.mul.Tensor,
+    torch.ops.aten.embedding_bag.padding_idx,
 }
 
 # A superset of default_quantizable_ops includes operators support the int8 data type
@@ -221,6 +222,12 @@ def _map_module_function_to_aten_operator_type():
                 torch.mul,
             ],
             torch.ops.aten.mul.Tensor,
+        ),
+        (
+            [
+                torch.nn.functional.embedding_bag,
+            ],
+            torch.ops.aten.embedding_bag.padding_idx,
         ),
     )
     for map_item in map_list:
@@ -739,6 +746,7 @@ class X86InductorQuantizer(Quantizer):
         self._annotate_linear_fusion_pattern(model, quantization_config, filter_fn)
         self._annotate_matmul(model, quantization_config, filter_fn)
         self._annotate_mul_tensor(model, quantization_config, filter_fn)
+        self._annotate_embeddingbag(model, quantization_config, filter_fn)
 
         # Step2: Recipe to propagate annotation for patterns beside conv/linear.
         # Go through all the nodes from start to end.
@@ -1618,6 +1626,39 @@ class X86InductorQuantizer(Quantizer):
             for input_node in mul_node.args:
                 input_qspec_map[input_node] = get_input_act_qspec(quantization_config)
             mul_node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
+                input_qspec_map=input_qspec_map,
+                _annotated=True,
+                _is_output_of_quantized_pattern=True,
+            )
+
+    def _annotate_embeddingbag(
+        self,
+        model: torch.fx.GraphModule,
+        quantization_config: Optional[QuantizationConfig],
+        filter_fn: Optional[FilterFn] = None,
+    ):
+        for node in model.graph.nodes:
+            if node.target != torch.ops.aten.embedding_bag.padding_idx:
+                continue
+
+            if _skip_annotate([node], filter_fn):
+                continue
+
+            if quantization_config is None:
+                _annotate_nodes_not_quantize(node)
+                continue
+
+            assert len(node.args) == 9
+
+            weight_index = 0
+
+            embeddingbag_node = node
+            weight_node = embeddingbag_node.args[weight_index]
+            assert isinstance(weight_node, Node)
+            input_qspec_map = {}
+            input_qspec_map[weight_node] = get_weight_qspec(quantization_config)
+
+            embeddingbag_node.meta[QUANT_ANNOTATION_KEY] = _X86InductorQuantizationAnnotation(
                 input_qspec_map=input_qspec_map,
                 _annotated=True,
                 _is_output_of_quantized_pattern=True,
