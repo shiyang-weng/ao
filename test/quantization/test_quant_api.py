@@ -926,6 +926,82 @@ class TestQuantFlow(TestCase):
             # load state_dict in cuda
             model.load_state_dict(sd, assign=True)
 
+    @unittest.skipIf(
+        "CPU" not in torch._C._dispatch_dump("torchao::qembeddingbag"),
+        reason="cpp kernels not built",
+    )
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_7, "Test only enabled for 2.7+")
+    def test_embeddingbag_cpu(self):
+        qtype = torch.float8_e4m3fn
+
+        class EmbCatDense(torch.nn.Module):
+            def __init__(self, NUM_TABLE, NUM_DIM, dtype):
+                super(EmbCatDense, self).__init__()
+                self.emblist = torch.nn.ModuleList()
+                self.weights = []
+                for _ in range(NUM_TABLE):
+                    self.emblist.append(
+                        torch.nn.EmbeddingBag(1000, NUM_DIM, mode="sum", dtype=dtype)
+                    )
+                    emb_weight = self.emblist[-1].weight.data.to(qtype)
+                    self.weights.append(emb_weight)
+                    self.emblist[-1].weight.data = emb_weight.to(dtype)
+                    self.emblist[-1] = self.emblist[-1].to(dtype)
+
+            def forward(self, indices, offsets):
+                sparse_out = []
+                for i, emb in enumerate(self.emblist):
+                    sparse_out.append(emb(indices[i], offsets[i]))
+                return torch.cat(sparse_out, dim=1)
+
+        NUM_TABLE = 26
+        index_type = torch.int64
+        multi_hot = [
+            3,
+            2,
+            1,
+            2,
+            6,
+            1,
+            1,
+            1,
+            1,
+            7,
+            3,
+            8,
+            1,
+            6,
+            9,
+            5,
+            1,
+            1,
+            1,
+            12,
+            100,
+            27,
+            10,
+            3,
+            1,
+            1,
+        ]
+        batch_size = 128
+        vector_size = 128
+        indices = [
+            torch.randint(1000, (batch_size * multi_hot[i],)).to(index_type)
+            for i in range(NUM_TABLE)
+        ]
+        offsets = [
+            torch.arange(0, batch_size * multi_hot[i], multi_hot[i]).to(index_type)
+            for i in range(NUM_TABLE)
+        ]
+        dtype = torch.float32
+        m = EmbCatDense(NUM_TABLE, vector_size, dtype)
+        weight_scales = torch.tensor([1.0] * NUM_TABLE)
+        with torch.no_grad():
+            test_out = torch.ops.torchao.qembeddingbag(m.weights, indices, offsets, weight_scales, 1.0, 128).to(dtype)
+            refe_out = m.forward(indices, offsets)#.to(qtype).to(dtype)
+            torch.testing.assert_close(refe_out, test_out, atol=0, rtol=0)
+
 
 common_utils.instantiate_parametrized_tests(TestQuantFlow)
 

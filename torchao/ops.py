@@ -70,6 +70,9 @@ lib.define(
 lib.define(
     "da8w4_linear_cpu(Tensor input, Tensor input_scales, Tensor input_qzeros, Tensor weight, Tensor weight_scales, Tensor weight_qzeros, Tensor compensation, Tensor? bias, ScalarType output_dtype) -> Tensor"
 )
+lib.define(
+    "qembeddingbag(Tensor[] qweights, Tensor[] indices, Tensor[] offsets, Tensor weight_scale, float o_scale, int batch_size) -> Tensor"
+)
 
 
 def register_custom_op(name):
