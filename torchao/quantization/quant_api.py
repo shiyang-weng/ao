@@ -15,7 +15,6 @@ come along with it and because that is how we access the intended quantized
 and mixed GEMM kernels
 """
 
-import importlib.util
 import logging
 import types
 import warnings
@@ -68,6 +67,9 @@ from torchao.quantization.linear_activation_weight_observed_tensor import (
     LinearActivationWeightObservedTensor,
 )
 from torchao.quantization.observer import AffineQuantizedObserverBase, get_block_size
+from torchao.quantization.quantize_.workflows import (
+    Int4PreshuffledTensor,
+)
 from torchao.quantization.transform_module import (
     _QUANTIZE_CONFIG_HANDLER,
     register_quantize_module_handler,
@@ -79,7 +81,7 @@ from torchao.utils import (
     TORCH_VERSION_AT_LEAST_2_4,
     TORCH_VERSION_AT_LEAST_2_5,
     TORCH_VERSION_AT_LEAST_2_6,
-    is_fbcode,
+    _is_fbgemm_genai_gpu_available,
     is_MI300,
     is_sm_at_least_89,
     is_sm_at_least_90,
@@ -369,7 +371,7 @@ def _replace_with_custom_fn_if_matches_filter_with_name(
 def _is_linear(mod, *args):
     # avoid circular dependencies
     from torchao.quantization.qat.affine_fake_quantized_tensor import (
-        AffineFakeQuantizedTensor,
+        _AffineFakeQuantizedTensor,
     )
 
     # adding weight tensor subclass isinstance check to make sure the weight is only quantized once
@@ -381,7 +383,7 @@ def _is_linear(mod, *args):
         and not isinstance(mod.weight, AutoQuantizableLinearWeight)
         and not isinstance(mod.weight, AffineQuantizedTensor)
         and not isinstance(mod.weight, LinearActivationQuantizedTensor)
-        and not isinstance(mod.weight, AffineFakeQuantizedTensor)
+        and not isinstance(mod.weight, _AffineFakeQuantizedTensor)
         and not isinstance(mod, nn.modules.linear.NonDynamicallyQuantizableLinear)
     )
 
@@ -1212,6 +1214,12 @@ def _int4_weight_only_transform(
 class Int8WeightOnlyConfig(AOBaseConfig):
     """
     Configuration for applying int8 weight-only symmetric per-channel quantization to linear layers.
+
+    Args:
+        group_size: Optional[int] = None - Controls the granularity of quantization. If None, applies per-channel quantization.
+            Otherwise, applies per-group quantization with the specified group size.
+        set_inductor_config: bool = True - If True, adjusts `torchinductor` settings to recommended values
+            for better performance with this quantization scheme.
     """
 
     group_size: Optional[int] = None
@@ -1355,7 +1363,17 @@ def _float8_cutlass_quant_sparse(
 class Int8DynamicActivationInt8WeightConfig(AOBaseConfig):
     """
     Configuration for applying int8 dynamic symmetric per-token activation and int8 per-channel weight
-    quantization to linear layers
+    quantization to linear layers.
+
+    Args:
+        layout: Optional[Layout] = PlainLayout() - Tensor layout for the quantized weights. Controls how the
+            quantized data is stored and accessed.
+        act_mapping_type: Optional[MappingType] = MappingType.SYMMETRIC - Mapping type for activation quantization.
+            SYMMETRIC uses symmetric quantization around zero.
+        weight_only_decode: bool = False - If True, only quantizes weights during forward pass and keeps activations
+            in original precision during decode operations.
+        set_inductor_config: bool = True - If True, adjusts `torchinductor` settings to recommended values
+            for better performance with this quantization scheme.
     """
 
     layout: Optional[Layout] = PlainLayout()
@@ -2038,6 +2056,7 @@ class FbgemmConfig(AOBaseConfig):
        weight_dtype (torch.dtype): weight dtype of the kernel
        output_dtype (torch.dtype): output dtype of the kernel
        group_size (int): The group size for weight
+       preshuffle (bool): whether preshuffle the weights or not
     """
 
     input_dtype: torch.dtype
@@ -2045,24 +2064,17 @@ class FbgemmConfig(AOBaseConfig):
     output_dtype: torch.dtype
     block_size: Optional[List[int]] = None
     activation_scale_ub: Optional[float] = None
-    transpose_input: bool = False
+    preshuffle: bool = False
 
 
 @register_quantize_module_handler(FbgemmConfig)
 def _(module: torch.nn.Module, config: FbgemmConfig) -> torch.nn.Module:
-    # TODO: use is_package_at_least("fbgemm_gpu", "1.2.0") when
-    # https://github.com/pytorch/FBGEMM/issues/4198 is fixed
-    if importlib.util.find_spec("fbgemm_gpu") is None:
-        raise ImportError("Requires fbgemm-gpu-genai >= 1.2.0")
-
-    import fbgemm_gpu.experimental.gen_ai  # noqa: F401
-
-    if not is_fbcode() and fbgemm_gpu.__version__ < "1.2.0":
+    if not _is_fbgemm_genai_gpu_available():
         raise ImportError("Requires fbgemm-gpu-genai >= 1.2.0")
 
     _SUPPORTED_DTYPES = {
         (torch.bfloat16, torch.int4, torch.bfloat16),
-        (e4m3_dtype, e4m3_dtype, torch.bfloat16),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16),
     }
 
     if (
@@ -2070,14 +2082,34 @@ def _(module: torch.nn.Module, config: FbgemmConfig) -> torch.nn.Module:
         and (config.weight_dtype == torch.int4)
         and (config.output_dtype == torch.bfloat16)
     ):
-        weight = to_fbgemm_int4(
-            module.weight,
-            config.block_size,
-            config.transpose_input,
-        )
+        if config.preshuffle:
+            weight = Int4PreshuffledTensor.from_float(
+                module.weight,
+                config.block_size,
+                activation_dtype=torch.bfloat16,
+            )
+        else:
+            weight = to_fbgemm_int4(
+                module.weight,
+                config.block_size,
+            )
         module.weight = torch.nn.Parameter(weight, requires_grad=False)
         module.extra_repr = types.MethodType(_linear_extra_repr, module)
         return module
+    if (
+        (config.input_dtype == e4m3_dtype)
+        and (config.weight_dtype == torch.int4)
+        and (config.output_dtype == torch.bfloat16)
+    ):
+        if config.preshuffle:
+            weight = Int4PreshuffledTensor.from_float(
+                module.weight,
+                config.block_size,
+                activation_dtype=torch.float8_e4m3fn,
+            )
+            module.weight = torch.nn.Parameter(weight, requires_grad=False)
+            module.extra_repr = types.MethodType(_linear_extra_repr, module)
+            return module
     elif (
         (config.input_dtype == e4m3_dtype)
         and (config.weight_dtype == e4m3_dtype)
@@ -2086,7 +2118,6 @@ def _(module: torch.nn.Module, config: FbgemmConfig) -> torch.nn.Module:
         weight = to_fbgemm_fp8(
             module.weight,
             config.activation_scale_ub,
-            config.transpose_input,
         )
         module.weight = torch.nn.Parameter(weight, requires_grad=False)
         module.extra_repr = types.MethodType(_linear_extra_repr, module)
