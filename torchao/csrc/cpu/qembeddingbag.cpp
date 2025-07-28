@@ -23,7 +23,7 @@ static inline int32_t _scale_int32(int32_t value, float scale) {
 }
 
 #if defined(CPU_CAPABILITY_AVX512)
-__m512 _mm512_e4m3_cvt_ps(const at::Float8_e4m3fn * weight, float* buf) {
+__m512 _mm512_load_e4m3_cvt_ps(const at::Float8_e4m3fn * weight, float* buf) {
   for (int i = 0; i < 16; i++) {
     buf[i] = static_cast<float>(weight[i]);
   }
@@ -51,7 +51,9 @@ inline void qembeddingbag_kern(
     const double scale,
     float* result) {
 #if defined(CPU_CAPABILITY_AVX512)
-  if (emb_dim == 128) {
+  if (emb_dim % 128 == 0) {
+      constexpr int64_t block_dim = 128;
+      const int64_t num_blocks = emb_dim / block_dim;
       __m512 scale_v = _mm512_set1_ps(scale);
       float buf[16];
       for (int64_t b = bs_begin; b < bs_end; ++b) {
@@ -60,146 +62,50 @@ inline void qembeddingbag_kern(
         int64_t end_idx = ((b + 1) == bs_end && last_offset != -1)
             ? last_offset
             : offsets[b + 1];
-        // load first indices
-        int64_t idx = indices[start_idx] * emb_dim;
-        x0 = _mm512_e4m3_cvt_ps(&weight[idx], buf);
-        x1 = _mm512_e4m3_cvt_ps(&weight[idx + 16], buf);
-        x2 = _mm512_e4m3_cvt_ps(&weight[idx + 32], buf);
-        x3 = _mm512_e4m3_cvt_ps(&weight[idx + 48], buf);
-        x4 = _mm512_e4m3_cvt_ps(&weight[idx + 64], buf);
-        x5 = _mm512_e4m3_cvt_ps(&weight[idx + 80], buf);
-        x6 = _mm512_e4m3_cvt_ps(&weight[idx + 96], buf);
-        x7 = _mm512_e4m3_cvt_ps(&weight[idx + 112], buf);
-        for (int64_t j = start_idx + 1; j < end_idx; ++j) {
-          // add following idx
-          idx = indices[j] * emb_dim;
-          x0 = _mm512_add_ps(x0, _mm512_e4m3_cvt_ps(&weight[idx], buf));
-          x1 = _mm512_add_ps(x1, _mm512_e4m3_cvt_ps(&weight[idx + 16], buf));
-          x2 = _mm512_add_ps(x2, _mm512_e4m3_cvt_ps(&weight[idx + 32], buf));
-          x3 = _mm512_add_ps(x3, _mm512_e4m3_cvt_ps(&weight[idx + 48], buf));
-          x4 = _mm512_add_ps(x4, _mm512_e4m3_cvt_ps(&weight[idx + 64], buf));
-          x5 = _mm512_add_ps(x5, _mm512_e4m3_cvt_ps(&weight[idx + 80], buf));
-          x6 = _mm512_add_ps(x6, _mm512_e4m3_cvt_ps(&weight[idx + 96], buf));
-          x7 = _mm512_add_ps(x7, _mm512_e4m3_cvt_ps(&weight[idx + 112], buf));
+        for (int64_t block_id = 0; block_id < num_blocks; block_id++) {
+          // load first indices
+          int64_t idx = indices[start_idx] * emb_dim + block_dim * block_id;
+          float* block_result = result + block_dim * block_id;
+          x0 = _mm512_load_e4m3_cvt_ps(&weight[idx], buf);
+          x1 = _mm512_load_e4m3_cvt_ps(&weight[idx + 16], buf);
+          x2 = _mm512_load_e4m3_cvt_ps(&weight[idx + 32], buf);
+          x3 = _mm512_load_e4m3_cvt_ps(&weight[idx + 48], buf);
+          x4 = _mm512_load_e4m3_cvt_ps(&weight[idx + 64], buf);
+          x5 = _mm512_load_e4m3_cvt_ps(&weight[idx + 80], buf);
+          x6 = _mm512_load_e4m3_cvt_ps(&weight[idx + 96], buf);
+          x7 = _mm512_load_e4m3_cvt_ps(&weight[idx + 112], buf);
+          for (int64_t j = start_idx + 1; j < end_idx; ++j) {
+            // add following idx
+            idx = indices[j] * emb_dim + block_dim * block_id;
+            x0 = _mm512_add_ps(x0, _mm512_load_e4m3_cvt_ps(&weight[idx], buf));
+            x1 = _mm512_add_ps(x1, _mm512_load_e4m3_cvt_ps(&weight[idx + 16], buf));
+            x2 = _mm512_add_ps(x2, _mm512_load_e4m3_cvt_ps(&weight[idx + 32], buf));
+            x3 = _mm512_add_ps(x3, _mm512_load_e4m3_cvt_ps(&weight[idx + 48], buf));
+            x4 = _mm512_add_ps(x4, _mm512_load_e4m3_cvt_ps(&weight[idx + 64], buf));
+            x5 = _mm512_add_ps(x5, _mm512_load_e4m3_cvt_ps(&weight[idx + 80], buf));
+            x6 = _mm512_add_ps(x6, _mm512_load_e4m3_cvt_ps(&weight[idx + 96], buf));
+            x7 = _mm512_add_ps(x7, _mm512_load_e4m3_cvt_ps(&weight[idx + 112], buf));
+          }
+          x0 = _mm512_mul_ps(x0, scale_v);
+          x1 = _mm512_mul_ps(x1, scale_v);
+          x2 = _mm512_mul_ps(x2, scale_v);
+          x3 = _mm512_mul_ps(x3, scale_v);
+          x4 = _mm512_mul_ps(x4, scale_v);
+          x5 = _mm512_mul_ps(x5, scale_v);
+          x6 = _mm512_mul_ps(x6, scale_v);
+          x7 = _mm512_mul_ps(x7, scale_v);
+          // store
+          _mm512_store_ps(block_result, x0);
+          _mm512_store_ps(block_result + 16, x1);
+          _mm512_store_ps(block_result + 32, x2);
+          _mm512_store_ps(block_result + 48, x3);
+          _mm512_store_ps(block_result + 64, x4);
+          _mm512_store_ps(block_result + 80, x5);
+          _mm512_store_ps(block_result + 96, x6);
+          _mm512_store_ps(block_result + 112, x7);
         }
-        x0 = _mm512_mul_ps(x0, scale_v);
-        x1 = _mm512_mul_ps(x1, scale_v);
-        x2 = _mm512_mul_ps(x2, scale_v);
-        x3 = _mm512_mul_ps(x3, scale_v);
-        x4 = _mm512_mul_ps(x4, scale_v);
-        x5 = _mm512_mul_ps(x5, scale_v);
-        x6 = _mm512_mul_ps(x6, scale_v);
-        x7 = _mm512_mul_ps(x7, scale_v);
-        // store
-        _mm512_store_ps(result, x0);
-        _mm512_store_ps(result + 16, x1);
-        _mm512_store_ps(result + 32, x2);
-        _mm512_store_ps(result + 48, x3);
-        _mm512_store_ps(result + 64, x4);
-        _mm512_store_ps(result + 80, x5);
-        _mm512_store_ps(result + 96, x6);
-        _mm512_store_ps(result + 112, x7);
         result += num_emb * emb_dim;
       }
-    return;
-  }
-#endif
-#if defined(CPU_CAPABILITY_AVX512)
-  if (emb_dim == 128) {
-    __m512 scale_v = _mm512_set1_ps(scale);
-    for (int64_t b = bs_begin; b < bs_end; ++b) {
-      __m512i x00, x64;
-      __m512i y0, y1, y2, y3, y4, y5, y6, y7;
-      __m512 f0, f1, f2, f3, f4, f5, f6, f7;
-      int64_t start_idx = offsets[b];
-      int64_t end_idx = ((b + 1) == bs_end && last_offset != -1)
-          ? last_offset
-          : offsets[b + 1];
-      // load first indices
-      int64_t idx = indices[start_idx] * emb_dim;
-      x00 = _mm512_load_si512(&weight[idx]);
-      x64 = _mm512_load_si512(&weight[idx + 64]);
-      y0 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 0));
-      y1 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 1));
-      y2 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 2));
-      y3 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 3));
-      y4 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 0));
-      y5 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 1));
-      y6 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 2));
-      y7 = _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 3));
-      for (int64_t j = start_idx + 1; j < end_idx; ++j) {
-        idx = indices[j] * emb_dim;
-        x00 = _mm512_load_si512(&weight[idx]);
-        x64 = _mm512_load_si512(&weight[idx + 64]);
-        y0 = _mm512_add_epi32(
-            y0, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 0)));
-        y1 = _mm512_add_epi32(
-            y1, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 1)));
-        y2 = _mm512_add_epi32(
-            y2, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 2)));
-        y3 = _mm512_add_epi32(
-            y3, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x00, 3)));
-        y4 = _mm512_add_epi32(
-            y4, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 0)));
-        y5 = _mm512_add_epi32(
-            y5, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 1)));
-        y6 = _mm512_add_epi32(
-            y6, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 2)));
-        y7 = _mm512_add_epi32(
-            y7, _mm512_cvtepi8_epi32(_mm512_extracti32x4_epi32(x64, 3)));
-      }
-      f0 = _mm512_cvt_roundepi32_ps(
-          y0, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f1 = _mm512_cvt_roundepi32_ps(
-          y1, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f2 = _mm512_cvt_roundepi32_ps(
-          y2, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f3 = _mm512_cvt_roundepi32_ps(
-          y3, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f4 = _mm512_cvt_roundepi32_ps(
-          y4, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f5 = _mm512_cvt_roundepi32_ps(
-          y5, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f6 = _mm512_cvt_roundepi32_ps(
-          y6, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f7 = _mm512_cvt_roundepi32_ps(
-          y7, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      f0 = _mm512_mul_ps(f0, scale_v);
-      f1 = _mm512_mul_ps(f1, scale_v);
-      f2 = _mm512_mul_ps(f2, scale_v);
-      f3 = _mm512_mul_ps(f3, scale_v);
-      f4 = _mm512_mul_ps(f4, scale_v);
-      f5 = _mm512_mul_ps(f5, scale_v);
-      f6 = _mm512_mul_ps(f6, scale_v);
-      f7 = _mm512_mul_ps(f7, scale_v);
-      y0 = _mm512_cvt_roundps_epi32(
-          f0, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y1 = _mm512_cvt_roundps_epi32(
-          f1, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y2 = _mm512_cvt_roundps_epi32(
-          f2, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y3 = _mm512_cvt_roundps_epi32(
-          f3, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y4 = _mm512_cvt_roundps_epi32(
-          f4, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y5 = _mm512_cvt_roundps_epi32(
-          f5, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y6 = _mm512_cvt_roundps_epi32(
-          f6, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      y7 = _mm512_cvt_roundps_epi32(
-          f7, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-      x00 = _mm512_inserti32x4(x00, _mm512_cvtsepi32_epi8(y0), 0);
-      x00 = _mm512_inserti32x4(x00, _mm512_cvtsepi32_epi8(y1), 1);
-      x00 = _mm512_inserti32x4(x00, _mm512_cvtsepi32_epi8(y2), 2);
-      x00 = _mm512_inserti32x4(x00, _mm512_cvtsepi32_epi8(y3), 3);
-      x64 = _mm512_inserti32x4(x64, _mm512_cvtsepi32_epi8(y4), 0);
-      x64 = _mm512_inserti32x4(x64, _mm512_cvtsepi32_epi8(y5), 1);
-      x64 = _mm512_inserti32x4(x64, _mm512_cvtsepi32_epi8(y6), 2);
-      x64 = _mm512_inserti32x4(x64, _mm512_cvtsepi32_epi8(y7), 3);
-      _mm512_store_si512(result, x00);
-      _mm512_store_si512(result + 64, x64);
-      result += num_emb * emb_dim;
-    }
     return;
   }
 #endif
@@ -207,15 +113,15 @@ inline void qembeddingbag_kern(
     int64_t start_idx = offsets[b];
     int64_t end_idx =
         ((b + 1) == bs_end && last_offset != -1) ? last_offset : offsets[b + 1];
-    for (int32_t d = 0; d < emb_dim; d++) {
+    for (int64_t d = 0; d < emb_dim; d++) {
       int64_t idx = indices[start_idx] * emb_dim;
-      int32_t value = int32_t(weight[idx + d]);
+      float value = float(weight[idx + d]);
       for (int64_t j = start_idx + 1; j < end_idx; ++j) {
         idx = indices[j] * emb_dim;
-        value += int32_t(weight[idx + d]);
+        value += float(weight[idx + d]);
       }
-      value = _scale_int32(int32_t(value), scale);
-      result[d] = int8_t(value);
+      value = value*scale;
+      result[d] = value;
     }
     result += num_emb * emb_dim;
   }
