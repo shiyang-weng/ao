@@ -133,17 +133,14 @@ void qembeddingbagcat(
     data_t** w_ptr,
     index_t** indices_ptr,
     index_t** offsets_ptr,
-    // int8_t* d_ptr,
     int64_t num_batch,
     int64_t num_emb,
     int64_t emb_dim,
     std::vector<int64_t> last_offsets,
     std::vector<double> w_scale,
-    // double d_scale,
     double o_scale) {
   constexpr int64_t b_block = 512;
   const int64_t n_b_blocks = (num_batch - 1) / b_block + 1;
-  // const double copy_scale = d_scale / o_scale;
   for (double& w_sca : w_scale) {
     w_sca = w_sca / o_scale;
   }
