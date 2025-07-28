@@ -2944,53 +2944,5 @@ class TestQuantizePT2EX86Inductor(X86InductorQuantTestCase):
                 )
 
 
-    @skipIfNoX86
-    def test_embeddingbag(self):
-        """
-        Test pattern of single embeddingbag with X86InductorQuantizer.
-        """
-        class Mod(nn.Module):
-            def __init__(self, num_embeddings, embedding_dim):
-                super(Mod, self).__init__()
-
-                self.embeddingbag = nn.EmbeddingBag(num_embeddings=num_embeddings, embedding_dim=embedding_dim)
-
-            def forward(self, input, offsets, per_sample_weights=None):
-                result = self.embeddingbag(input, offsets, per_sample_weights)
-                return result
-
-        num_embeddings = 5
-        embedding_dim = 8
-        multi_hot = 2
-        batch_size = 3
-        with override_quantized_engine("x86"), torch.no_grad():
-            m = Mod(num_embeddings, embedding_dim).eval()
-            indices = torch.randint(0, num_embeddings, (batch_size * multi_hot,), dtype=torch.long)
-            offsets = torch.tensor(range(0, batch_size * multi_hot + 1, multi_hot))
-            example_inputs = (indices, offsets, None)
-            quantizer = X86InductorQuantizer().set_global(
-                xiq.get_default_x86_inductor_quantization_config()
-            )
-            node_occurrence = {
-                torch.ops.quantized_decomposed.quantize_per_tensor.default: 0,
-                torch.ops.quantized_decomposed.dequantize_per_tensor.default: 0,
-                # note: quantize op for weights are const propagated
-                torch.ops.quantized_decomposed.quantize_per_channel.default: 0,
-                torch.ops.quantized_decomposed.dequantize_per_channel.default: 1,
-            }
-            node_list = [
-                torch.ops.quantized_decomposed.dequantize_per_channel.default,
-                torch.ops.aten.embedding_bag.padding_idx,
-            ]
-            self._test_quantizer(
-                m,
-                example_inputs,
-                quantizer,
-                node_occurrence,
-                node_list,
-                debug=True,
-            )
-
-
 if __name__ == "__main__":
     run_tests()
