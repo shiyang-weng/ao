@@ -65,11 +65,13 @@ da8w4_linear_prepack_impl(
   at::Tensor blocked_scales = new_scales.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
   at::Tensor blocked_qzeros = new_qzeros.view({Nc, block_n, G}).permute({0, 2, 1}).contiguous();
   // Compensation = Σ(k)(W[k][n] - ZP[n]) for each block.
+  // Reorder compensation to [N/block_n, K/block_k, block_n]
   auto weight_sub_qzero = weight.view({Nc, block_n, G, -1}).to(at::kInt) - new_qzeros.view({Nc, block_n, G, -1});
   weight_sub_qzero = weight_sub_qzero.view({Nc, block_n, Kc, block_k});
   at::Tensor compensation = weight_sub_qzero.sum(-1);
   compensation = compensation.permute({0, 2, 1}).contiguous().to(at::kInt);
 
+#if defined(CPU_CAPABILITY_AVX512)
   if (cpublas_could_pack()) {
     blocked_weight = at::empty({Nc, Kc, block_k, block_n / 2}, weight.options());
     auto weight_ptr = weight_reordered.data_ptr<uint8_t>();
@@ -105,7 +107,9 @@ da8w4_linear_prepack_impl(
         }
       }
     });
-  } else {
+  } else
+#endif
+  {
     // Pack weight: two int4 -> one int8
     using namespace at::indexing;
     at::Tensor even_columns =
@@ -619,9 +623,9 @@ void _da8w4_linear_impl(
     } else if (M < 64) {
       return 32;
     } else if (M < 96) {
-      return 48;
-    } else {
       return 64;
+    } else {
+      return 128;
     }
   }();
   int64_t Mc = (M + block_m - 1) / block_m;

@@ -6,22 +6,27 @@ and up to [**1.25x at 8 GPU / 8B parameter count scale**](#training-benchmarks).
 The codebase strives to stay small, hackable, debuggable with native PyTorch tooling
 and composable with key systems such as autograd, ```torch.compile``` and distributed.
 
+## Key features
+
+* e2e pretraining speedups of up to [**1.5x at 512 GPU / 405B parameter count scale**](https://pytorch.org/blog/training-using-float8-fsdp2/),
+and up to [**1.25x at 8 GPU / 8B parameter count scale**](#training-benchmarks), with performance and accuracy validated on up to [**2k GPUs**](https://pytorch.org/blog/accelerating-large-scale-training-and-convergence-with-pytorch-float8-rowwise-on-crusoe-2k-h200s/), via [torchtitan's float8 integration](https://github.com/pytorch/torchtitan/blob/main/docs/float8.md)
+* seamless composability with [torch.compile](https://docs.pytorch.org/docs/stable/torch.compiler.html)
+* seamless composability with [DTensor](https://docs.pytorch.org/docs/stable/distributed.tensor.html), including [FSDP2 with float8 weight all-gather](https://dev-discuss.pytorch.org/t/enabling-float8-all-gather-in-fsdp2/2359) and [Async TP](https://discuss.pytorch.org/t/distributed-w-torchtitan-introducing-async-tensor-parallelism-in-pytorch/209487)
+* seamless composability with [PyTorch Activation Checkpointing](https://pytorch.org/blog/activation-checkpointing-techniques/)
+* three different scaling recipes to trade off performance vs accuracy: tensorwise (fastest), rowwise, rowwise_with_gw_hp (most accurate)
+
 ℹ️ <em>See the [feature tracker](https://github.com/pytorch/ao/issues/556) for upcoming features.</em>
 
 ℹ️ <em>These APIs are training-only and float8-only, and we plan to [unify them with the rest of torchao](https://github.com/pytorch/ao/issues/894) in the future.</em>
 
 # Single GPU User API
 
-## float8 linear with dynamic tensorwise scaling
-
-This is the default recipe, with a good balance of performance and accuracy.
-
 ```python
 import time
 
 import torch
 import torch.nn as nn
-from torchao.float8 import convert_to_float8_training
+from torchao.float8 import convert_to_float8_training, Float8LinearConfig
 from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
 
 if not TORCH_VERSION_AT_LEAST_2_5:
@@ -47,8 +52,15 @@ def module_filter_fn(mod: torch.nn.Module, fqn: str):
             return False
     return True
 
+# configure float8 recipe
+# valid recipe names: "tensorwise", "rowwise", "rowwise_with_gw_hp"
+config = Float8LinearConfig.from_recipe_name("tensorwise")
+
 # convert specified `torch.nn.Linear` modules to `Float8Linear`
-convert_to_float8_training(m, module_filter_fn=module_filter_fn)
+convert_to_float8_training(m, config=config, module_filter_fn=module_filter_fn)
+
+# display converted model
+print(m)
 
 # enable torch.compile for competitive performance
 m = torch.compile(m)
@@ -75,55 +87,6 @@ end_time = time.time()
 print("Training time:", end_time - start_time)
 ```
 
-## float8 linear with rowwise scaling
-
-This is a more accurate recipe compared to tensorwise, with more granular scaling.
-
-```python
-import torch
-import torch.nn as nn
-from torchao.float8 import convert_to_float8_training, Float8LinearConfig
-from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
-
-if not TORCH_VERSION_AT_LEAST_2_5:
-    raise AssertionError("torchao.float8 requires PyTorch version 2.5 or greater")
-
-# create model and sample input
-m = nn.Sequential(
-    nn.Linear(2048, 4096),
-    nn.Linear(4096, 128),
-).bfloat16().cuda()
-x = torch.randn(4096, 2048, device="cuda", dtype=torch.bfloat16)
-optimizer = torch.optim.SGD(m.parameters(), lr=0.1)
-
-# optional: filter modules from being eligible for float8 conversion
-def module_filter_fn(mod: torch.nn.Module, fqn: str):
-    # don't convert the last module
-    if fqn == "1":
-        return False
-    # don't convert linear modules with weight dimensions not divisible by 16
-    if isinstance(mod, torch.nn.Linear):
-        if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-            return False
-    return True
-
-# configure rowwise scaling
-config = Float8LinearConfig.from_recipe_name("rowwise")
-
-# convert specified `torch.nn.Linear` modules to `Float8Linear`
-convert_to_float8_training(m, config=config, module_filter_fn=module_filter_fn)
-
-# enable torch.compile for competitive performance
-m = torch.compile(m)
-
-# toy training loop
-for _ in range(10):
-    optimizer.zero_grad()
-    y = m(x)
-    y.sum().backward()
-    optimizer.step()
-```
-
 # Multi GPU User API
 
 We compose with the `DTensor` based [distributed APIs](https://pytorch.org/docs/stable/distributed.tensor.parallel.html),
@@ -134,30 +97,32 @@ on using `torchao.float8` in a distributed setting.
 
 A common question about float8 training is "when is float8 linear faster vs bfloat16?".  Given the M, K, N of the forward pass through your linear, you can reference the tables below for a microbenchmark based speedup estimate on NVIDIA H100:
 
-### Tensorwise scaling
+### tensorwise scaling
 
-<img width="805" alt="float8_speedup" src="https://github.com/user-attachments/assets/5c5f2817-7eb7-4cab-bd03-49fe70cd31a8">
-
-Example 1 (small shapes):
-* forward input tensor size 1024x2048, linear weight size 2048x1024; M, K, N = 1024, 2048, 1024
-* benchmark speedup is 0.80
-* recommendation: leave this linear in bfloat16, the shapes are too small to benefit from float8 compute
-
-Example 2 (large shapes):
-* forward input tensor size 4096x8192, linear weight size 8192x16384; M, K, N = 4096, 8192, 16384
-* benchmark speedup is 1.39
-* recommendation: enable float8 for this linear to get a speedup
-
-To reproduce the raw data for table above, you can run the following script
+<img width="753" height="773" alt="Image" src="https://github.com/user-attachments/assets/e46c671a-ed35-41b4-b17c-50caf1629ecb" />
 
 ```lang=shell
+# reproduction: run the script below
 python benchmarks/float8/float8_roofline.py your_output_filename.csv --shape_gen_name sweep
 ```
 
-### Rowwise scaling
+### rowwise scaling
 
-<img width="805" alt="float8_rowwise_speedup" src="../../docs/static/fp8-rowwise-perf.png" />
+<img width="755" height="778" alt="Image" src="https://github.com/user-attachments/assets/7d70ba36-f480-459f-b5c0-797895332631" />
 
+```lang=shell
+# reproduction: run the script below
+python benchmarks/float8/float8_roofline.py your_output_filename.csv --shape_gen_name sweep --float8_recipe_name rowwise
+```
+
+### rowwise_with_gw_hp scaling
+
+<img width="750" height="797" alt="Image" src="https://github.com/user-attachments/assets/e4479abc-1aca-436d-a142-60e5e804ff10" />
+
+```lang=shell
+# reproduction: run the script below
+python benchmarks/float8/float8_roofline.py your_output_filename.csv --shape_gen_name sweep --float8_recipe_name rowwise_with_gw_hp
+```
 
 ## Derivation
 
@@ -248,12 +213,12 @@ To reproduce these benchmarks, you can follow these steps:
 1. On a machine with 8 H100 GPUs, clone torchtitan and follow local installation [steps](https://github.com/pytorch/torchtitan?tab=readme-ov-file#installation),
 including [downloading a tokenizer](https://github.com/pytorch/torchtitan?tab=readme-ov-file#downloading-a-tokenizer).
 2. Install torchao following these [steps](https://github.com/pytorch/ao/tree/main?tab=readme-ov-file#installation).
-3. From the `torchao/float8/benchmarking/` directory, you can run the following commands to reproduce the benchmarks above:
-   - bf16 + compile: `TORCHTITAN_ROOT=<path> ./float8_training_benchmark.sh`
-   - float8 tensorwise with float8 all-gather + compile: `TORCHTITAN_ROOT=<path> FLOAT8_RECIPE_WITH_BEST_SETTINGS="tensorwise" ./float8_training_benchmark.sh`
-   - float8 rowwise with bf16 all-gather + compile: `TORCHTITAN_ROOT=<path> FLOAT8_RECIPE_WITH_BEST_SETTINGS="rowwise" ./float8_training_benchmark.sh`
+3. From the `torchao/benchmarks/float8/training/` directory, you can run the following commands to reproduce the benchmarks above:
+   - bf16 + compile: `TORCHTITAN_ROOT=<path> ./torchtitan_benchmark.sh`
+   - float8 tensorwise with float8 all-gather + compile: `TORCHTITAN_ROOT=<path> FLOAT8_RECIPE_WITH_BEST_SETTINGS="tensorwise" ./torchtitan_benchmark.sh`
+   - float8 rowwise with bf16 all-gather + compile: `TORCHTITAN_ROOT=<path> FLOAT8_RECIPE_WITH_BEST_SETTINGS="rowwise" ./torchtitan_benchmark.sh`
 
-See the float8 training benchmarking [guide](.torchao/float8/benchmarking/README.md) for more details.
+See the float8 training benchmarking [guide](.torchao/benchmarks/float8/training/README.md) for more details.
 
 # E2E training + inference flow
 

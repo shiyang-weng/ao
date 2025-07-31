@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import torch
 import torch.nn.utils.parametrize as parametrize
+from torch.utils._python_dispatch import return_and_correct_aliasing
 
 __all__ = [
     "benchmark_model",
@@ -216,15 +217,12 @@ def _register_custom_op(lib, inductor_decomposed=True):
         if TORCH_VERSION_AT_LEAST_2_5:
             from torch._library.infer_schema import infer_schema
 
-            # expecting fn.__name__ starts with `_` and we want to take the rest
-            # to be the name of the custom op
-            assert fn.__name__[0] == "_", (
-                f"Expecting function name starts with `_`, got {fn.__name__}"
-            )
             assert not any(c in fn.__name__ for c in ".<>"), (
                 f"Expecting op to be defined in normal functions, not lambda or local: {fn.__name__}"
             )
-            op_name = fn.__name__[1:]
+            op_name = fn.__name__
+            if op_name[0] == "_":
+                op_name = op_name[1:]
             schema = op_name + infer_schema(fn, mutates_args={})
             lib.define(schema)
             lib.impl(op_name, fn, dispatch_key)
@@ -233,6 +231,17 @@ def _register_custom_op(lib, inductor_decomposed=True):
             op = getattr(getattr(torch.ops, lib_namespace), op_name)
             if inductor_decomposed:
                 register_decomposition([op])(fn)
+            return op
+        else:
+            return fn
+
+    return decorator
+
+
+def _register_meta_op(lib, op_name):
+    def decorator(fn):
+        if TORCH_VERSION_AT_LEAST_2_5:
+            op = lib.impl(op_name, fn, "Meta")
             return op
         else:
             return fn
@@ -401,6 +410,9 @@ def _implements(cls, aten_ops_or_torch_fns):
     if not hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE"):
         cls._ATEN_OP_OR_TORCH_FN_TABLE = {}
 
+    if cls not in cls._ATEN_OP_OR_TORCH_FN_TABLE:
+        cls._ATEN_OP_OR_TORCH_FN_TABLE[cls] = {}
+
     if not isinstance(aten_ops_or_torch_fns, (list, tuple)):
         aten_ops_or_torch_fns = [aten_ops_or_torch_fns]
 
@@ -411,10 +423,81 @@ def _implements(cls, aten_ops_or_torch_fns):
             def wrapper(f, types, args, kwargs):
                 return func(f, types, args, kwargs)
 
-            cls._ATEN_OP_OR_TORCH_FN_TABLE[op] = wrapper
+            cls._ATEN_OP_OR_TORCH_FN_TABLE[cls][op] = wrapper
         return func
 
     return decorator
+
+
+def _implements_common_tensor_ops(cls):
+    implements = cls.implements
+    aten = torch.ops.aten
+
+    @implements(
+        [aten.detach.default, aten.clone.default, aten.alias.default, aten.contiguous]
+    )
+    def _(func, types, args, kwargs):
+        return return_and_correct_aliasing(
+            func,
+            args,
+            kwargs,
+            args[0]._apply_fn_to_data(lambda x: func(x, *args[1:], **kwargs)),
+        )
+
+    def _same_metadata(self: TorchAOBaseTensor, src: TorchAOBaseTensor) -> bool:
+        _tensor_shape_match = all(
+            getattr(self, t_name).shape == getattr(src, t_name).shape
+            for t_name in self.tensor_data_names
+        )
+        _attr_match = all(
+            getattr(self, a_name) == getattr(src, a_name)
+            for a_name in self.tensor_attribute_names
+        )
+        return (
+            type(self) == type(src)
+            and self.shape == src.shape
+            and _tensor_shape_match
+            and _attr_match
+        )
+
+    @implements(aten.copy_.default)
+    def _(func, types, args, kwargs):
+        self = args[0]
+        src = args[1]
+        if _same_metadata(self, src):
+            self_tensors = self.__tensor_flatten__()[0]
+            for tensor_name in self_tensors:
+                getattr(self, tensor_name).copy_(getattr(src, tensor_name))
+            return
+        raise ValueError(
+            f"Not supported args for copy_ due to metadata mismatch: {args[0], args[1]}"
+        )
+
+    @implements(aten._to_copy.default)
+    def _(func, types, args, kwargs):
+        self = args[0]
+        if hasattr(self, "tensor_data_names") and hasattr(
+            self, "tensor_attribute_names"
+        ):
+            kwargs = self._get_to_kwargs(*args[1:], **kwargs)
+            device = kwargs.pop("device")
+            tensors = [
+                getattr(self, name).to(device) for name in self.tensor_data_names
+            ]
+            # change device
+            tensor_attributes = [
+                getattr(self, attr_name) if attr_name != "device" else device
+                for attr_name in self.tensor_attribute_names
+            ]
+            t = self.__class__(
+                *tensors,
+                *tensor_attributes,
+            )
+            return return_and_correct_aliasing(func, args, kwargs, t)
+
+        raise NotImplementedError(
+            "Subclasses must implement `aten._to_copy.default` or specify `tensor_data_names` and `tensor_attribute_names` for tensor class or tensor instance before using it"
+        )
 
 
 def _dispatch__torch_function__(cls, func, types, args=(), kwargs=None):
@@ -428,9 +511,10 @@ def _dispatch__torch_function__(cls, func, types, args=(), kwargs=None):
     kwargs = {} if kwargs is None else kwargs
     if (
         hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE")
-        and func in cls._ATEN_OP_OR_TORCH_FN_TABLE
+        and cls in cls._ATEN_OP_OR_TORCH_FN_TABLE
+        and func in cls._ATEN_OP_OR_TORCH_FN_TABLE[cls]
     ):
-        return cls._ATEN_OP_OR_TORCH_FN_TABLE[func](func, types, args, kwargs)
+        return cls._ATEN_OP_OR_TORCH_FN_TABLE[cls][func](func, types, args, kwargs)
 
     with torch._C.DisableTorchFunctionSubclass():
         return func(*args, **kwargs)
@@ -446,9 +530,10 @@ def _dispatch__torch_dispatch__(cls, func, types, args, kwargs):
     """
     if (
         hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE")
-        and func in cls._ATEN_OP_OR_TORCH_FN_TABLE
+        and cls in cls._ATEN_OP_OR_TORCH_FN_TABLE
+        and func in cls._ATEN_OP_OR_TORCH_FN_TABLE[cls]
     ):
-        return cls._ATEN_OP_OR_TORCH_FN_TABLE[func](func, types, args, kwargs)
+        return cls._ATEN_OP_OR_TORCH_FN_TABLE[cls][func](func, types, args, kwargs)
 
     arg_types = tuple(type(arg) for arg in args)
     kwarg_types = {k: type(arg) for k, arg in kwargs.items()}
@@ -568,7 +653,28 @@ class TorchAOBaseTensor(torch.Tensor):
 
     """
 
+    @classmethod
+    def __init_subclass__(cls, **kwargs):
+        if not hasattr(cls, "_ATEN_OP_OR_TORCH_FN_TABLE"):
+            cls._ATEN_OP_OR_TORCH_FN_TABLE = {}
+
+        if cls not in cls._ATEN_OP_OR_TORCH_FN_TABLE:
+            cls._ATEN_OP_OR_TORCH_FN_TABLE[cls] = {}
+
+        # define the common ops if the tensor_data_names and tensor_attribute_names are defined
+        if hasattr(cls, "tensor_data_names") and hasattr(cls, "tensor_attribute_names"):
+            cls._implements_common_tensor_ops()
+
+        # inherit the torch function and dispatch implementations from direct parent classes
+        # e.g. for `class C(B, A)`, C.__bases__ == (B, A)
+        for parent in cls.__bases__:
+            if parent in cls._ATEN_OP_OR_TORCH_FN_TABLE:
+                cls._ATEN_OP_OR_TORCH_FN_TABLE[cls].update(
+                    cls._ATEN_OP_OR_TORCH_FN_TABLE[parent]
+                )
+
     implements = classmethod(_implements)
+    _implements_common_tensor_ops = classmethod(_implements_common_tensor_ops)
     __torch_dispatch__ = classmethod(_dispatch__torch_dispatch__)
     __torch_function__ = classmethod(_dispatch__torch_function__)
     register_layout = classmethod(_register_layout)
@@ -576,16 +682,57 @@ class TorchAOBaseTensor(torch.Tensor):
     _get_to_kwargs = _get_to_kwargs
 
     def __tensor_flatten__(self):
-        raise NotImplementedError("Subclasses must implement __tensor_flatten__")
+        if hasattr(self, "tensor_data_names") and hasattr(
+            self, "tensor_attribute_names"
+        ):
+            return self.tensor_data_names, [
+                getattr(self, attr) for attr in self.tensor_attribute_names
+            ]
+        raise NotImplementedError(
+            "Subclasses should implement __tensor_flatten__ or specify `tensor_data_names` and `tensor_attribute_names` for tensor class or tensor instance before using it"
+        )
 
     @classmethod
     def __tensor_unflatten__(
         cls, tensor_data_dict, tensor_attributes, outer_size, outer_stride
     ):
-        raise NotImplementedError("Subclasses must implement __tensor_unflatten__")
+        tensors = [tensor_data_dict[name] for name in cls.tensor_data_names]
+        return cls(*tensors, *tensor_attributes)
+
+    def _apply_fn_to_data(self, fn):
+        if hasattr(self, "tensor_data_names") and hasattr(
+            self, "tensor_attribute_names"
+        ):
+            tensors = [fn(getattr(self, attr)) for attr in self.tensor_data_names]
+            tensor_attributes = [
+                getattr(self, attr) for attr in self.tensor_attribute_names
+            ]
+            return self.__class__(
+                *tensors,
+                *tensor_attributes,
+            )
+
+        raise NotImplementedError(
+            "Subclasses should implement _apply_fn_to_data or specify `tensor_data_names` and `tensor_attribute_names` for tensor class or tensor instance before using it"
+        )
 
     def __repr__(self):
-        raise NotImplementedError("Subclasses must implement __repr__")
+        if hasattr(self, "tensor_data_names") and hasattr(
+            self, "tensor_attribute_names"
+        ):
+            repr_str = ""
+            repr_str += f"{self.tensor_data_names[0]}={getattr(self, self.tensor_data_names[0])}"
+            for tensor_data_name in self.tensor_data_names[1:]:
+                repr_str += f", {tensor_data_name}={getattr(self, tensor_data_name)}"
+            for tensor_attribute_name in self.tensor_attribute_names:
+                repr_str += (
+                    f", {tensor_attribute_name}={getattr(self, tensor_attribute_name)}"
+                )
+            return f"{self.__class__.__name__}({repr_str})"
+
+        raise NotImplementedError(
+            "Subclasses must implement __repr__ or specify `tensor_data_names` and `tensor_attribute_names` for tensor class or tensor instance before using it"
+        )
 
     def get_layout(self):
         if not hasattr(self, "_layout"):
@@ -705,6 +852,10 @@ def check_xpu_version(device, version="2.8.0"):
     return device == "xpu" and compare_versions(torch.__version__, version) >= 0
 
 
+def ceil_div(a, b):
+    return (a + b - 1) // b
+
+
 TORCH_VERSION_AFTER_2_5 = _torch_version_at_least("2.5.0.dev")
 TORCH_VERSION_AFTER_2_4 = _torch_version_at_least("2.4.0.dev")
 TORCH_VERSION_AFTER_2_3 = _torch_version_at_least("2.3.0.dev")
@@ -717,3 +868,17 @@ def is_package_at_least(package_name: str, min_version: str):
         return False
 
     return version(package_name) >= min_version
+
+
+def _is_fbgemm_genai_gpu_available():
+    # TODO: use is_package_at_least("fbgemm_gpu", "1.2.0") when
+    # https://github.com/pytorch/FBGEMM/issues/4198 is fixed
+    if importlib.util.find_spec("fbgemm_gpu") is None:
+        return False
+
+    import fbgemm_gpu.experimental.gen_ai  # noqa: F401
+
+    if not is_fbcode() and fbgemm_gpu.__version__ < "1.2.0":
+        return False
+
+    return True

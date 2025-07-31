@@ -20,6 +20,7 @@ from torchao.utils import (
     TORCH_VERSION_AT_LEAST_2_5,
     TORCH_VERSION_AT_LEAST_2_6,
     _register_custom_op,
+    _register_meta_op,
 )
 
 __all__ = [
@@ -35,7 +36,7 @@ __all__ = [
     "_choose_qparams_affine_floatx",
     "_choose_qparams_and_quantize_affine_hqq",
     "_choose_qparams_and_quantize_affine_qqq",
-    "_choose_qparams_affine_float8",
+    "_choose_scale_float8",
     "_choose_qparams_gguf",
     "_quantize_affine_no_zero_point",
     "_quantize_affine_tinygemm",
@@ -1172,7 +1173,7 @@ def _do_fake_quantize_affine(
     elif zero_point_domain == ZeroPointDomain.FLOAT:
         _quantize_affine = _quantize_affine_tinygemm_no_dtype_cast
         _dequantize_affine = _dequantize_affine_tinygemm_no_dtype_check
-    elif ZeroPointDomain == ZeroPointDomain.NONE:
+    elif zero_point_domain == ZeroPointDomain.NONE:
         _quantize_affine = _quantize_affine_no_zero_point_no_dtype_cast
         _dequantize_affine = _dequantize_affine_no_zero_point_no_dtype_check
     else:
@@ -2178,11 +2179,14 @@ def _dequantize_affine_floatx(
     return tensor
 
 
-def _choose_qparams_affine_float8(
+@register_custom_op
+def _choose_scale_float8(
     tensor: torch.Tensor,
+    block_size: List[int],
     float8_dtype: torch.dtype = torch.float8_e4m3fn,
     scale_dtype: torch.dtype = torch.float32,
-    block_size: Optional[Tuple[int, ...]] = None,
+    hp_value_lb: Optional[float] = None,
+    hp_value_ub: Optional[float] = None,
 ) -> torch.Tensor:
     """
     Calculates float8 scaling factor for the given high precision tensor, using tensorwise granularity.
@@ -2192,11 +2196,15 @@ def _choose_qparams_affine_float8(
         float8_dtype (torch.dtype): Data type of the quantized tensor (e.g., torch.float8_e4m3fn, torch.float8_e5m2).
         scale_dtype (torch.dtype): Data type of the scaling factor (e.g., torch.float32).
         block_size (Optional[Tuple[int, ...]]): Block size for block-wise quantization. If None, tensorwise quantization is used.
+        hp_value_lb (Optional[float]): the lower bound for high precision floating point value for calculating scale
+        hp_value_ub (Optional[float]): the upper bound for high precision floating point value for calculating scale
     """
     quant_max = torch.finfo(float8_dtype).max
     # only tensorwise scaling is supported for now:
-    if block_size is None:
+    if len(block_size) == 0:
         max_abs = tensor.abs().max()
+        if hp_value_lb is not None or hp_value_ub is not None:
+            max_abs = torch.clamp(max_abs, min=hp_value_lb, max=hp_value_ub)
         scale = max_abs / quant_max
     else:
         shape_for_reduction, reduction_dims = _get_reduction_params(
@@ -2204,7 +2212,8 @@ def _choose_qparams_affine_float8(
         )
         tensor_reshaped = tensor.view(shape_for_reduction)
         max_abs = tensor_reshaped.abs().amax(dim=reduction_dims, keepdim=True)
-
+        if hp_value_lb is not None or hp_value_ub is not None:
+            max_abs = torch.clamp(max_abs, min=hp_value_lb, max=hp_value_ub)
         scale = max_abs / quant_max
         # Reshape scale back to match the expected output shape
         # The scale tensor should have the same shape as the input divided by block_size
@@ -2291,7 +2300,7 @@ def _quantize_affine_float8(
     return fp8_tensor
 
 
-@torch.library.impl(quant_lib, "quantize_affine_float8", "Meta")
+@_register_meta_op(quant_lib, "quantize_affine_float8")
 def _quantize_affine_float8_meta(
     tensor: torch.Tensor,
     scale: torch.Tensor,
@@ -2318,7 +2327,7 @@ def _dequantize_affine_float8(
     return hp_tensor.to(output_dtype)
 
 
-@torch.library.impl(quant_lib, "dequantize_affine_float8", "Meta")
+@_register_meta_op(quant_lib, "dequantize_affine_float8")
 def _dequantize_affine_float8_meta(
     tensor: torch.Tensor,
     scale: torch.Tensor,

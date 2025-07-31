@@ -17,6 +17,7 @@ import torch.nn as nn
 from parameterized import parameterized
 from torch._dynamo import config
 from torch._inductor.utils import run_and_get_code
+from torch.testing import FileCheck
 
 import torchao
 from torchao.dtypes import Int4CPULayout, Int4XPULayout, TensorCoreTiledLayout
@@ -37,6 +38,7 @@ from torchao.quantization.autoquant import (
 
 # APIs to be deprecated (used for torch 2.2.2 and 2.3)
 from torchao.quantization.quant_api import (
+    Float8DynamicActivationFloat8WeightConfig,
     _replace_with_custom_fn_if_matches_filter,
     change_linear_weights_to_int4_woqtensors,
     change_linear_weights_to_int8_dqtensors,
@@ -66,11 +68,11 @@ from torchao.quantization.utils import (
     LoggingTensorMode,
     _apply_logging_hook,
     _fqn_to_op_to_shape_to_count,
+    _quant_int8_dynamic_per_token_linear,
+    _quantize_activation_per_token_absmax,
     compute_error,
     dequantize_per_channel,
     dynamically_quantize_per_channel,
-    quant_int8_dynamic_per_token_linear,
-    quantize_activation_per_token_absmax,
 )
 from torchao.quantization.utils import (
     compute_error as SQNR,
@@ -86,6 +88,7 @@ from torchao.utils import (
     check_cpu_version,
     check_xpu_version,
     is_fbcode,
+    is_sm_at_least_89,
     is_sm_at_least_90,
     unwrap_tensor_subclass,
 )
@@ -554,7 +557,7 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
 
     def _test_quantize_per_token_impl(self, device, dtype):
         x = torch.randn(3, 3, 3, device=device, dtype=dtype)
-        xq, scales = quantize_activation_per_token_absmax(x)
+        xq, scales = _quantize_activation_per_token_absmax(x)
         block_size = (1, 1, 3)
         x_dq = dequantize_affine(
             xq, block_size, scales, None, torch.int8, output_dtype=x.dtype
@@ -578,7 +581,7 @@ class PythonQuantUtilOpUnitTest(unittest.TestCase):
         # Note: need to make the weight contiguous because we are
         # testing in eager mode and cuBlas will not give correct results
         # for a transposed weight
-        y = quant_int8_dynamic_per_token_linear(
+        y = _quant_int8_dynamic_per_token_linear(
             x, wq.t().contiguous(), w_scales, None, dtype
         )
         y_ref = torch.matmul(x, w.t())
@@ -1676,9 +1679,9 @@ class TestAutoQuant(unittest.TestCase):
         assert not isinstance(mod.mha.out_proj.weight, AutoQuantizableLinearWeight)
         assert isinstance(mod.lin.weight, AutoQuantizableLinearWeight)
         mod(*input)
-        from torchao.quantization.autoquant import AUTOQUANT_CACHE
+        from torchao.quantization.autoquant import _AUTOQUANT_CACHE
 
-        assert len(AUTOQUANT_CACHE) > 0
+        assert len(_AUTOQUANT_CACHE) > 0
 
     @parameterized.expand(COMMON_DEVICE_DTYPE)
     @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_5, "autoquant requires 2.5+.")
@@ -2076,6 +2079,31 @@ class TestExport(unittest.TestCase):
             self.assertTrue(torch.ops.torchao.choose_qparams_affine.default in targets)
             self.assertTrue(torch.ops.torchao.quantize_affine.default in targets)
             self.assertFalse(torch.ops.aten.narrow.default in targets)
+
+    @unittest.skipIf(
+        not is_sm_at_least_89(), "Requires GPU with compute capability >= 8.9"
+    )
+    def test_export_float8(self):
+        class SimpleNetwork(torch.nn.Module):
+            def __init__(self):
+                super(SimpleNetwork, self).__init__()
+                self.linear = torch.nn.Linear(
+                    in_features=32, out_features=16, bias=False
+                )
+
+            def forward(self, x):
+                return self.linear(x)
+
+        model = SimpleNetwork().eval().cuda()
+        inp = torch.randn(2, 32).cuda()
+        config = Float8DynamicActivationFloat8WeightConfig()
+        quantize_(model, config)
+
+        ep = torch.export.export(model, (inp,))
+        print(ep)
+        FileCheck().check_count(
+            "torch.ops.torchao.choose_scale_float8.default", 1, exactly=True
+        ).run(str(ep.graph))
 
 
 class TestUtils(unittest.TestCase):
