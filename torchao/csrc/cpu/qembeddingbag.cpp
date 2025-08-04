@@ -3,26 +3,15 @@
 #include <ATen/native/CPUBlas.h>
 #include <c10/util/Unroll.h>
 #include <c10/util/Float8_e4m3fn.h>
+#include <ATen/native/EmbeddingBag.h>
 
 namespace torchao {
 
 namespace {
 
-static inline int32_t _scale_int32(int32_t value, float scale) {
-  auto v_simd = _mm_setzero_ps();
-  auto s_simd = _mm_set1_ps(scale);
-  v_simd = _mm_cvt_si2ss(v_simd, value);
-  v_simd = _mm_mul_round_ss(
-      v_simd, s_simd, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-  int32_t c = _mm_cvt_roundss_si32(
-      v_simd, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-  auto c_simd = _mm_set1_epi32(c);
-  c_simd = _mm_cvtsepi32_epi8(c_simd);
-  c = _mm_cvtsi128_si32(c_simd);
-  return c;
-}
-
 #if defined(CPU_CAPABILITY_AVX512)
+// Hardware not support e4m3 intrinsic yet
+// Will change to use intrinsic after it is supported
 __m512 _mm512_load_e4m3_cvt_ps(const at::Float8_e4m3fn * weight, float* buf) {
   for (int i = 0; i < 16; i++) {
     buf[i] = static_cast<float>(weight[i]);
@@ -30,7 +19,7 @@ __m512 _mm512_load_e4m3_cvt_ps(const at::Float8_e4m3fn * weight, float* buf) {
   return _mm512_loadu_ps(buf);
 }
 
-void _mm512_ps_cvt_e4m3(at::Float8_e4m3fn* result, const __m512 x, float * buf) {
+void _mm512_store_ps_cvt_e4m3(at::Float8_e4m3fn* result, const __m512 x, float * buf) {
   _mm512_storeu_ps(buf, x);
   for (int i = 0; i < 16; i++) {
     result[i] = static_cast<at::Float8_e4m3fn>(buf[i]);
@@ -130,97 +119,83 @@ inline void qembeddingbag_kern(
 template <typename index_t, typename data_t>
 void qembeddingbagcat(
     float* o_ptr,
-    data_t** w_ptr,
-    index_t** indices_ptr,
-    index_t** offsets_ptr,
+    data_t* w_ptr,
+    index_t* indices_ptr,
+    index_t* offsets_ptr,
     int64_t num_batch,
-    int64_t num_emb,
     int64_t emb_dim,
-    std::vector<int64_t> last_offsets,
-    std::vector<double> w_scale,
+    index_t last_offset,
+    double w_scale,
     double o_scale) {
   constexpr int64_t b_block = 512;
   const int64_t n_b_blocks = (num_batch - 1) / b_block + 1;
-  for (double& w_sca : w_scale) {
-    w_sca = w_sca / o_scale;
-  }
+  w_scale /= o_scale;
+  const int64_t num_emb = 1;
 #pragma omp parallel for collapse(2)
   for (int64_t b = 0; b < n_b_blocks; ++b) {
     for (int64_t n = 0; n < num_emb; ++n) {
       const int64_t bs_begin = b * b_block;
       const int64_t bs_end = std::min(num_batch, (b + 1) * b_block);
       float* r = &o_ptr[b * b_block * num_emb * emb_dim + n * emb_dim];
-      const int64_t m = n;
       // avoid offsets not include last batch
-      const index_t last_offset = bs_end == num_batch ? last_offsets[m] : -1;
       qembeddingbag_kern(
           bs_begin,
           bs_end,
           num_emb,
           emb_dim,
           last_offset,
-          indices_ptr[m],
-          offsets_ptr[m],
-          w_ptr[m],
-          w_scale[m],
+          indices_ptr,
+          offsets_ptr,
+          w_ptr,
+          w_scale,
           r);
     }
   }
 }
 
 at::Tensor qembeddingbag_impl(
-    const at::TensorList& qweights,
-    const at::TensorList& indices,
-    const at::TensorList& offsets,
+    const at::Tensor& qweight,
+    const at::Tensor& indices,
+    const at::Tensor& offsets,
     const at::Tensor& w_scales,
     double o_scale,
-    int64_t batch_size) {
-  int64_t num_emb = qweights.size();
-  TORCH_CHECK(num_emb > 0);
-  TORCH_CHECK(num_emb == indices.size());
-  TORCH_CHECK(num_emb == offsets.size());
-  int64_t emb_dim = qweights[0].size(1);
+    const int64_t mode,
+    bool include_last_offset) {
+  // Only support include_last_offset == True and mode == at::native::EmbeddingBagMode::SUM
+  TORCH_CHECK(include_last_offset);
+  TORCH_CHECK(mode == at::native::EmbeddingBagMode::SUM);
+  int64_t batch_size = include_last_offset ? offsets.size(0) - 1 : offsets.size(0);
+  int64_t emb_dim = qweight.size(1);
 
-  auto index_type = indices[0].scalar_type();
-  auto qtype = qweights[0].scalar_type();
+  auto index_type = indices.scalar_type();
+  auto qtype = qweight.scalar_type();
+  float w_scale = w_scales.data_ptr<float>()[0];
 
-  std::vector<int64_t> last_offsets(num_emb, -1);
-  std::vector<double> w_scale(num_emb, -1);
-  float * w_scale_ptrs = w_scales.data_ptr<float>();
+  TORCH_CHECK(
+      indices.is_contiguous());
+  TORCH_CHECK(
+      offsets.is_contiguous() && offsets.scalar_type() == index_type);
+  TORCH_CHECK(
+      qweight.is_contiguous());
+  TORCH_CHECK(
+      qweight.dim() == 2);
+  // handle last offsets
+  int64_t last_offset = indices.numel();
 
-  for (int i = 0; i < num_emb; i++) {
-    TORCH_CHECK(
-        indices[i].is_contiguous() && indices[i].scalar_type() == index_type);
-    TORCH_CHECK(
-        offsets[i].is_contiguous() && offsets[i].scalar_type() == index_type);
-    TORCH_CHECK(
-        qweights[i].is_contiguous() && qweights[i].scalar_type() == qtype);
-    TORCH_CHECK(
-        qweights[i].dim() == 2 && qweights[i].size(1) == emb_dim);
-    // handle last offsets
-    last_offsets[i] = indices[i].numel();
-    w_scale[i] = w_scale_ptrs[i];
-  }
-  at::Tensor output = at::empty({batch_size, num_emb * emb_dim}, qweights[0].options().dtype(at::kFloat));
-  AT_DISPATCH_INDEX_TYPES(indices[0].scalar_type(), "embeddingbag_cat", [&] {
-    at::Float8_e4m3fn* qweights_ptr[num_emb];
-    index_t* indices_ptr[num_emb];
-    index_t* offsets_ptr[num_emb];
-    for (int i = 0; i < num_emb; i++) {
-      qweights_ptr[i] = qweights[i].data_ptr<at::Float8_e4m3fn>();
-      indices_ptr[i] = indices[i].data_ptr<index_t>();
-      offsets_ptr[i] = offsets[i].data_ptr<index_t>();
-    }
+  at::Tensor output = at::empty({batch_size, emb_dim}, qweight.options().dtype(at::kFloat));
+  AT_DISPATCH_INDEX_TYPES(indices.scalar_type(), "embeddingbag_cat", [&] {
+    at::Float8_e4m3fn* qweight_ptr = qweight.data_ptr<at::Float8_e4m3fn>();
+    index_t* indices_ptr = indices.data_ptr<index_t>();
+    index_t* offsets_ptr = offsets.data_ptr<index_t>();
     float* output_ptr = output.data_ptr<float>();
     qembeddingbagcat<index_t, at::Float8_e4m3fn>(
         output_ptr,
-        qweights_ptr,
+        qweight_ptr,
         indices_ptr,
         offsets_ptr,
         batch_size,
-        num_emb,
         emb_dim,
-        last_offsets,
+        last_offset,
         w_scale,
         o_scale);
   });
