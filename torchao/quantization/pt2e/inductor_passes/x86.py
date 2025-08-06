@@ -3,6 +3,7 @@
 import copy
 import functools
 import itertools
+import operator
 from typing import Any
 
 import torch
@@ -37,10 +38,10 @@ _VIEW_FUNCTION_OPS = [
 ]
 
 _VIEW_METHOD_OPS = [
-    'transpose',
-    'permute',
-    'view',
-    'reshape',
+    "transpose",
+    "permute",
+    "view",
+    "reshape",
 ]
 
 """
@@ -2843,6 +2844,144 @@ def _register_qlinear_binary_fusion():
             )
 
 
+def _register_fp8_qembeddingbag_pass(pattern, pass_number, dtype=torch.float32):
+    @register_freezing_graph_pattern(
+        pattern,
+        # TODO: add extra_check
+        # extra_check=_is_valid_dequant_promotion_pattern(dtype),
+        pass_number=pass_number,
+    )
+    def fp8_qembeddingbag(match: Match, *args, **kwargs):
+        # Dequant_promotion will transform
+        # graph 1:
+        #            quant
+        #      + - - - | - - - +
+        #      |    dequant    |
+        #      |    /     \    |
+        #      |  node1  node2 |
+        #      + - | - - - | - +
+        #        quant   quant
+        # into:
+        # graph 2:
+        #            quant
+        #      + - - / - \ - - +
+        #      |dequant dequant|
+        #      |    |      |   |
+        #      | node1 node2   |
+        #      + - | - - - | - +
+        #        quant   quant
+        # In graph 1, the dequant node is shared by node1 and node2,
+        # as a result, neither node1 nor node2 could form an int8
+        # fusion pattern.
+        # After this transformation, the graph 2 could hit the int8
+        # fusion pattern: dequant-node-quant, respectively for
+        # node1 and node2.
+        assert dtype in [torch.float32, torch.bfloat16]
+
+        getitem_node = match.output_node()
+        embedding_bag_node = getitem_node.args[0]
+        assert embedding_bag_node.target is aten._embedding_bag_forward_only.default
+
+        embedding_bag_weight_index = 0
+        if dtype == torch.float32:
+            # pattern: embedding_bag -> dequant
+            dequant_node = embedding_bag_node.args[embedding_bag_weight_index]
+        else:
+            # pattern: embedding_bag -> to_bf16 -> dequant
+            weight_to_bf16_node = embedding_bag_node.args[embedding_bag_weight_index]
+            dequant_node = weight_to_bf16_node.args[0]
+
+        assert dequant_node.target in [
+            quantized_decomposed.dequantize_per_tensor.default,
+            quantized_decomposed.dequantize_per_tensor.tensor,
+            torch.ops.torchao.dequantize_affine_float8.default,
+        ]
+
+        # Weight QParams
+        qw, w_scale = kwargs["qw"], kwargs["w_scale"]
+
+        # Input Params
+        indices, offsets, include_last_offset = (
+            kwargs["indices"],
+            kwargs["offsets"],
+            kwargs["include_last_offset"],
+        )
+        # only support fp32 and bf16 output, next setp support fp8 output
+        o_scale = 1.0
+
+        graph = match.graph
+        with graph.inserting_before(getitem_node):
+            new_args: tuple[Any, ...] = (
+                qw,
+                indices,
+                offsets,
+                w_scale,
+                o_scale,
+                include_last_offset,
+            )
+
+            new_embedding_bag_node = graph.call_function(
+                torch.ops.torchao.qembeddingbag.default, args=new_args
+            )
+
+            getitem_node.replace_all_uses_with(new_embedding_bag_node)
+            new_embedding_bag_node.meta.update(embedding_bag_node.meta)
+
+            graph.erase_node(getitem_node)
+            graph.erase_node(embedding_bag_node)
+            # Erase the dequant pattern
+            graph.erase_node(dequant_node)
+            if dtype == torch.bfloat16:
+                graph.erase_node(weight_to_bf16_node)  # type: ignore[possibly-undefined]
+
+        counters["inductor"]["dequant_embeddingbag_matcher_count"] += 1
+        counters["inductor"]["dequant_embeddingbag_matcher_nodes"] += len(match.nodes)
+
+
+def _generate_qembeddingbag_patterns(dq_pattern):
+    embedding_bag_pattern = CallFunction(
+        torch.ops.aten._embedding_bag_forward_only.default,
+        dq_pattern,
+        KeywordArg("indices"),
+        KeywordArg("offsets"),
+        Arg(),
+        KeywordArg("mode"),
+        KeywordArg("sparse"),
+        Arg(),
+        KeywordArg("include_last_offset"),
+    )
+    return CallFunction(
+        operator.getitem,
+        embedding_bag_pattern,
+        KeywordArg("item"),
+    )
+
+
+def _register_quantization_fp8_qembeddingbag_pass():
+    for dtype in [torch.float32, torch.bfloat16]:
+        _register_fp8_qembeddingbag_pass(
+            _generate_qembeddingbag_patterns(
+                _may_generate_pattern_with_dtype_convert(
+                    CallFunction(
+                        torch.ops.torchao.dequantize_affine_float8.default,
+                        KeywordArg("qw"),
+                        KeywordArg("w_scale"),
+                        output_dtype=KeywordArg("w_dq_dtype"),
+                    ),
+                    KeywordArg("autocast_act_dtype"),
+                    dtype == torch.bfloat16,
+                ),
+            ),
+            pass_number=0,
+            dtype=dtype,
+        )  # pass_number=0 to run before weight prepack
+
+
+@functools.lru_cache(None)
+def _register_quantization_qembeddingbag_pass():
+    _register_quantization_fp8_qembeddingbag_pass()
+
+
 @functools.lru_cache(None)
 def _register_quantization_weight_pack_pass():
     # Step 1: Dequant promotion for int8-mixed-fp32/bf16
@@ -2903,8 +3042,9 @@ def quant_lift_up(module_graph: torch.fx.graph.Graph):
     """
 
     def is_view_op(node):
-        return (node.op == "call_function" and node.target in _VIEW_FUNCTION_OPS) or \
-            (node.op == "call_method" and node.target in _VIEW_METHOD_OPS)
+        return (node.op == "call_function" and node.target in _VIEW_FUNCTION_OPS) or (
+            node.op == "call_method" and node.target in _VIEW_METHOD_OPS
+        )
 
     for node in module_graph.nodes:
         # <TODO> Leslie: Here we verify that the quant node has exactly
@@ -2916,7 +3056,7 @@ def quant_lift_up(module_graph: torch.fx.graph.Graph):
             node.op == "call_function"
             and node.target in _PER_TENSOR_QUANTIZE_OPS
             # TODO: len(node.all_input_nodes) == 2 for fp8 quant
-            #and len(node.all_input_nodes) == 1
+            # and len(node.all_input_nodes) == 1
             and is_view_op(node.all_input_nodes[0])
         ):
             quant_node = node
