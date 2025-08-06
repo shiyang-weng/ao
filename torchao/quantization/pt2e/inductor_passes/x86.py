@@ -2901,9 +2901,10 @@ def _register_fp8_qembeddingbag_pass(pattern, pass_number, dtype=torch.float32):
         qw, w_scale = kwargs["qw"], kwargs["w_scale"]
 
         # Input Params
-        indices, offsets, include_last_offset = (
+        indices, offsets, mode, include_last_offset = (
             kwargs["indices"],
             kwargs["offsets"],
+            kwargs["mode"],
             kwargs["include_last_offset"],
         )
         # only support fp32 and bf16 output, next setp support fp8 output
@@ -2917,6 +2918,7 @@ def _register_fp8_qembeddingbag_pass(pattern, pass_number, dtype=torch.float32):
                 offsets,
                 w_scale,
                 o_scale,
+                mode,
                 include_last_offset,
             )
 
