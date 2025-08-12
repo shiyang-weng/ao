@@ -2931,10 +2931,10 @@ def _register_fp8_qembeddingbag_pass(pattern, pass_number, dtype=torch.float32):
 
             graph.erase_node(getitem_node)
             graph.erase_node(embedding_bag_node)
-            # Erase the dequant pattern
-            graph.erase_node(dequant_node)
             if dtype == torch.bfloat16:
                 graph.erase_node(weight_to_bf16_node)  # type: ignore[possibly-undefined]
+            # Erase the dequant pattern
+            graph.erase_node(dequant_node)
 
         counters["inductor"]["dequant_embeddingbag_matcher_count"] += 1
         counters["inductor"]["dequant_embeddingbag_matcher_nodes"] += len(match.nodes)
