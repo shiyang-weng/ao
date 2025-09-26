@@ -5,8 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from torch.distributed._tensor import DTensor
 
-from torchao.prototype.mx_formats.kernels import triton_mx_block_rearrange
+from torchao.prototype.mx_formats.config import (
+    MXFP8Dim1CastKernelChoice,
+    ScaleCalculationMode,
+)
+from torchao.prototype.mx_formats.kernels import (
+    mxfp8_quantize_cuda,
+    triton_mx_block_rearrange,
+    triton_to_mxfp8_dim1,
+)
+from torchao.prototype.mx_formats.mx_tensor import MXTensor
 
 Tensor = torch.Tensor
 
@@ -15,7 +25,7 @@ def ceil_div(a, b):
     return (a + b - 1) // b
 
 
-def to_blocked(input_matrix, use_triton_kernel: bool = True) -> Tensor:
+def to_blocked(input_matrix, use_triton_kernel: bool = False) -> Tensor:
     """
     Rearrange a large matrix by breaking it into blocks and applying the rearrangement pattern.
 
@@ -58,6 +68,38 @@ def to_blocked(input_matrix, use_triton_kernel: bool = True) -> Tensor:
     return rearranged.flatten()
 
 
+def from_blocked(
+    blocked_tensor: Tensor, original_rows: int, original_cols: int
+) -> Tensor:
+    """
+    Inverse of to_blocked: convert from blocked layout back to regular row-major layout.
+
+    Args:
+        blocked_tensor: Flattened blocked tensor from to_blocked()
+        original_rows: Original number of rows before blocking
+        original_cols: Original number of columns before blocking
+
+    Returns:
+        Tensor of shape (original_rows, original_cols) in regular layout
+    """
+    n_row_blocks = ceil_div(original_rows, 128)
+    n_col_blocks = ceil_div(original_cols, 4)
+
+    rearranged = blocked_tensor.view(n_row_blocks * n_col_blocks, 32, 16)
+
+    temp = rearranged.reshape(n_row_blocks * n_col_blocks, 32, 4, 4)
+
+    temp = temp.transpose(1, 2)
+
+    blocks = temp.reshape(n_row_blocks, n_col_blocks, 128, 4)
+
+    padded_view = blocks.permute(0, 2, 1, 3)
+
+    padded = padded_view.reshape(n_row_blocks * 128, n_col_blocks * 4)
+
+    return padded[:original_rows, :original_cols]
+
+
 def _to_blocked_single(scales: Tensor) -> Tensor:
     """Assume that we have a 128x4 block of scales in K Major order
 
@@ -67,3 +109,65 @@ def _to_blocked_single(scales: Tensor) -> Tensor:
     assert scales.shape == (128, 4)
     scales_tiled = scales.view(4, 32, 4)  # view as 4 - (32, 4) tiles
     return scales_tiled.transpose(0, 1).reshape(32, 16)  # Interleave tiles
+
+
+def _to_mxfp8_dim1_kernel_wrapper(
+    a,
+    block_size,
+    elem_dtype,
+    hp_dtype,
+    gemm_kernel_choice,
+    cast_kernel_choice,
+    scale_calculation_mode: ScaleCalculationMode,
+):
+    if cast_kernel_choice == MXFP8Dim1CastKernelChoice.TRITON:
+        assert scale_calculation_mode == ScaleCalculationMode.FLOOR
+        a_data, a_scale = triton_to_mxfp8_dim1(a, block_size)
+    elif cast_kernel_choice == MXFP8Dim1CastKernelChoice.CUDA:
+        assert scale_calculation_mode in (
+            ScaleCalculationMode.FLOOR,
+            ScaleCalculationMode.RCEIL,
+        )
+        _, a_data, _, a_scale = mxfp8_quantize_cuda(
+            a,
+            rowwise=False,
+            colwise=True,
+            scaling_mode=scale_calculation_mode.value,
+        )
+    else:
+        raise ValueError(f"must be one of [CUDA, TRITON], got {cast_kernel_choice}")
+
+    if isinstance(a_data, DTensor):
+        assert isinstance(a_scale, DTensor)
+        a_data_local = a_data.to_local()
+        a_scale_local = a_scale.to_local()
+        inner = MXTensor(
+            a_data_local.t(),
+            a_scale_local,
+            elem_dtype,
+            block_size,
+            hp_dtype,
+            gemm_kernel_choice,
+            False,
+            None,
+        )
+        mx_tensor = DTensor.from_local(
+            inner,
+            a_data.device_mesh,
+            a_data.placements,
+            run_check=False,
+            shape=a_data.t().size(),
+            stride=a_data.t().stride(),
+        )
+    else:
+        mx_tensor = MXTensor(
+            a_data.t(),
+            a_scale,
+            elem_dtype,
+            block_size,
+            hp_dtype,
+            gemm_kernel_choice,
+            False,
+            None,
+        )
+    return mx_tensor

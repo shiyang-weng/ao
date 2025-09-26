@@ -18,6 +18,7 @@ from torchao.quantization import (
     Float8DynamicActivationFloat8WeightConfig,
     Float8WeightOnlyConfig,
     FPXWeightOnlyConfig,
+    GemliteUIntXWeightOnlyConfig,
     Int4WeightOnlyConfig,
     Int8DynamicActivationInt4WeightConfig,
     Int8DynamicActivationInt8WeightConfig,
@@ -72,18 +73,13 @@ class BenchmarkConfig:
         self.high_precision_dtype = self._parse_precision(
             params.get("high_precision_dtype", "torch.bfloat16")
         )
-        self.use_torch_compile = bool(params.get("use_torch_compile", False))
-        self.torch_compile_mode = (
-            params.get("torch_compile_mode", "default")
-            if self.use_torch_compile
-            else None
-        )
+        self.torch_compile_mode = params.get("torch_compile_mode", "default")
         self.device = get_default_device(params.get("device", None))
         self.model_type = params.get("model_type", "linear")
         self.output_dir = f"{output_dir}/{self.benchmark_mode}"
         self.name = params.get(
             "name",
-            f"benchmark_{self.quantization}_{self.model_type}_m{self.m}_k{self.k}_n{self.n}{'_compile' if self.use_torch_compile else ''}",
+            f"benchmark_{self.quantization}_{self.model_type}_m{self.m}_k{self.k}_n{self.n}{'_compile'}",
         )
         self.enable_profiler = bool(params.get("enable_profiler", False))
         self.enable_memory_profiler = bool(params.get("enable_memory_profiler", False))
@@ -107,7 +103,6 @@ class BenchmarkConfig:
             "k": self.k,
             "n": self.n,
             "high_precision_dtype": self.high_precision_dtype,
-            "use_torch_compile": self.use_torch_compile,
             "torch_compile_mode": self.torch_compile_mode,
             "device": self.device,
             "model_type": self.model_type,
@@ -124,9 +119,13 @@ class BenchmarkResult:
     ):
         self.config = config
         self.output_dir = config.output_dir
-        self.baseline_inference_time_in_ms = 0.0
-        self.model_inference_time_in_ms = 0.0
-        self.speedup = 0.0
+        self.baseline_model_eager_inference_time_in_ms = 0.0
+        self.quantized_model_eager_inference_time_in_ms = 0.0
+        self.baseline_model_compiled_inference_time_in_ms = 0.0
+        self.quantized_model_compiled_inference_time_in_ms = 0.0
+        self.eager_speedup_on_baseline = 0.0
+        self.compile_speedup_on_baseline = 0.0
+        self.compile_speedup_on_eager = 0.0
         self.profiler_json_path: Optional[str] = None
         self.memory_profile_path: Optional[str] = None
         self.memory_visualization_path: Optional[str] = None
@@ -136,9 +135,13 @@ class BenchmarkResult:
         """Convert result to dictionary for main function"""
         result_dict = {
             **self.config.to_dict(),
-            "baseline_inference_time_in_ms": self.baseline_inference_time_in_ms,
-            "model_inference_time_in_ms": self.model_inference_time_in_ms,
-            "speedup": self.speedup,
+            "baseline_model_eager_inference_time_in_ms": self.baseline_model_eager_inference_time_in_ms,
+            "quantized_model_eager_inference_time_in_ms": self.quantized_model_eager_inference_time_in_ms,
+            "baseline_model_compiled_inference_time_in_ms": self.baseline_model_compiled_inference_time_in_ms,
+            "quantized_model_compiled_inference_time_in_ms": self.quantized_model_compiled_inference_time_in_ms,
+            "eager speedup on baseline": self.eager_speedup_on_baseline,
+            "compile speedup on baseline": self.compile_speedup_on_baseline,
+            "eager vs compile speedup": self.compile_speedup_on_eager,
             "profiler_json_path": self.profiler_json_path,
             "memory_profile_path": self.memory_profile_path,
             "memory_visualization_path": self.memory_visualization_path,
@@ -203,7 +206,7 @@ def string_to_config(
             128,
             256,
         ], f"int4wo group_size needs to be one of [32,64,128,256] but got {group_size}"
-        return Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq)
+        return Int4WeightOnlyConfig(group_size=group_size, use_hqq=use_hqq, version=1)
     elif "int8adq-int4w-symm" in quantization:
         from torchao.dtypes import CutlassInt4PackedLayout
 
@@ -226,7 +229,7 @@ def string_to_config(
         elif sparsity is not None and ("semi" in sparsity or "2:4" in sparsity):
             from torchao.dtypes import MarlinSparseLayout
 
-            return Int4WeightOnlyConfig(layout=MarlinSparseLayout())
+            return Int4WeightOnlyConfig(layout=MarlinSparseLayout(), version=1)
     if "fp6" in quantization:
         return FPXWeightOnlyConfig(3, 2)
     elif "uintx" in quantization:
@@ -257,7 +260,6 @@ def string_to_config(
             "int8_dynamic_activation_intx_weight requires using high_precision_dtype=torch.float32"
         )
 
-        from torchao.dtypes import PackedLinearInt8DynamicActivationIntxWeightLayout
         from torchao.quantization.granularity import PerAxis, PerGroup
         from torchao.quantization.quant_api import (
             Int8DynamicActivationIntxWeightConfig,
@@ -275,8 +277,7 @@ def string_to_config(
             weight_mapping_type=MappingType.ASYMMETRIC
             if is_asymmetric
             else MappingType.SYMMETRIC,
-            weight_scale_dtype=torch.bfloat16,
-            layout=PackedLinearInt8DynamicActivationIntxWeightLayout(),
+            intx_packing_format="opaque_torchao_auto",
         )
     elif "float8wo" in quantization:
         return Float8WeightOnlyConfig()
@@ -291,6 +292,23 @@ def string_to_config(
         else:
             granularity = PerTensor()
         return Float8DynamicActivationFloat8WeightConfig(granularity=granularity)
+    if "gemlitewo" in quantization:
+        params = quantization.split("-")
+        bit_width = int(params[1]) if len(params) > 1 else 4
+        group_size = (
+            int(params[2])
+            if len(params) > 2 and bit_width == 4
+            else None
+            if bit_width == 8
+            else 64
+        )
+        assert group_size in [
+            32,
+            64,
+            128,
+            256,
+        ], f"int4wo group_size needs to be one of [32,64,128,256] but got {group_size}"
+        return GemliteUIntXWeightOnlyConfig(group_size=group_size, bit_width=bit_width)
     return None
 
 
@@ -390,9 +408,13 @@ def print_results(results: List[BenchmarkResult]):
             result.config.quantization or "baseline",
             result.config.sparsity or "none",
             f"{result.config.shape_name} ({result.config.m}, {result.config.k}, {result.config.n})",
-            f"{result.baseline_inference_time_in_ms:.2f}",
-            f"{result.model_inference_time_in_ms:.2f}",
-            f"{result.speedup:.2f}x",
+            f"{result.baseline_model_eager_inference_time_in_ms:.2f}",
+            f"{result.quantized_model_eager_inference_time_in_ms:.2f}",
+            f"{result.eager_speedup_on_baseline:.2f}x",
+            f"{result.baseline_model_compiled_inference_time_in_ms:.2f}",
+            f"{result.quantized_model_compiled_inference_time_in_ms:.2f}",
+            f"{result.compile_speedup_on_baseline:.2f}x",
+            f"{result.compile_speedup_on_eager:.2f}x",
             str(result.config.enable_profiler),
         ]
 
@@ -404,9 +426,13 @@ def print_results(results: List[BenchmarkResult]):
         "Quantization",
         "Sparsity",
         "Shape",
-        "Baseline Inference Time (ms)",
-        "Inference Time (ms)",
-        "Speedup",
+        "Eager Baseline Inference Time (ms)",
+        "Eager Model Inference Time (ms)",
+        "Eager Speedup",
+        "Compile Baseline Inference Time (ms)",
+        "Compile Model Inference Time (ms)",
+        "Compile Speedup",
+        "Eager vs Compile Speedup",
         "Profiler Enabled",
     ]
 

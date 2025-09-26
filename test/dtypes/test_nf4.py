@@ -20,6 +20,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     apply_activation_checkpointing,
 )
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+from torch.testing._internal import common_utils
 from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest
 from torch.testing._internal.common_utils import (
@@ -28,6 +29,9 @@ from torch.testing._internal.common_utils import (
     parametrize,
     run_tests,
 )
+
+if common_utils.SEED is None:
+    common_utils.SEED = 1234
 
 import torchao
 from packaging import version
@@ -39,7 +43,7 @@ from torchao.dtypes.nf4tensor import (
     to_nf4,
 )
 from torchao.testing.utils import skip_if_rocm
-from torchao.utils import TORCH_VERSION_AT_LEAST_2_7
+from torchao.utils import torch_version_at_least
 
 bnb_available = False
 
@@ -119,7 +123,7 @@ class TestNF4Linear(TestCase):
     @unittest.skipIf(not bnb_available, "Need bnb availble")
     @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
     @unittest.skipIf(
-        TORCH_VERSION_AT_LEAST_2_7, reason="Failing in CI"
+        torch_version_at_least("2.7.0"), reason="Failing in CI"
     )  # TODO: fix this
     @skip_if_rocm("ROCm enablement in progress")
     @parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -146,7 +150,7 @@ class TestNF4Linear(TestCase):
     @unittest.skipIf(not torch.cuda.is_available(), "Need CUDA available")
     @skip_if_rocm("ROCm enablement in progress")
     @unittest.skipIf(
-        TORCH_VERSION_AT_LEAST_2_7, reason="Failing in CI"
+        torch_version_at_least("2.7.0"), reason="Failing in CI"
     )  # TODO: fix this
     @parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
     def test_nf4_bnb_linear(self, dtype: torch.dtype):
@@ -435,17 +439,22 @@ class TestFSDPOps(TestCase):
             inner_tensor = getattr(viewed_tensor, attr)
             self.assertEqual(inner_tensor.size(0), inner_tensor.numel())
 
-    @parametrize("input_size", [(512 * 512,), (512, 512)])
+    @parametrize("input_size", [(512, 512)])
+    def test_tensor_2d_view_valid(self, input_size: Tuple[int]):
+        nf4_tensor = to_nf4(torch.randn(input_size))
+        viewed_tensor = nf4_tensor.view(input_size)
+        self.assertEqual(viewed_tensor.dim(), 2)
+        self.assertEqual(viewed_tensor.numel(), math.prod(input_size))
+        for attr in _INNER_TENSOR_NAMES_FOR_SHARDING:
+            inner_tensor = getattr(viewed_tensor, attr)
+            self.assertEqual(inner_tensor.size(0), inner_tensor.numel())
+
+    @parametrize("input_size", [(512 * 512,)])
     def test_tensor_view_invalid(self, input_size: Union[Tuple[int], int]):
         nf4_tensor = to_nf4(torch.randn(input_size))
         if len(input_size) == 1:
             with self.assertRaisesRegex(
                 NotImplementedError, "aten.view\\(NF4Tensor\\) with size"
-            ):
-                nf4_tensor.view(input_size)
-        if len(input_size) == 2:
-            with self.assertRaisesRegex(
-                NotImplementedError, "aten.view\\(NF4Tensor\\) with len\\(size\\)"
             ):
                 nf4_tensor.view(input_size)
 
@@ -739,6 +748,42 @@ class TestQLoRA(FSDPTest):
                     )
             base_optim.step()
             self.assertEqual(fsdp_loss, base_loss)
+
+
+class TestComm(FSDPTest):
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @skip_if_lt_x_gpu(2)
+    def test_comm(self):
+        self.run_subtests(
+            {"input_size": [512, 2048]},
+            self._test_comm,
+        )
+
+    def _test_comm(self, input_size: int):
+        from torch.distributed._composable.fsdp import fully_shard
+        from torch.distributed._tensor import distribute_tensor
+
+        model = nn.Linear(input_size, input_size, device="cuda")
+        origin_tensor = model.weight
+        origin_nf4_tensor = to_nf4(origin_tensor)
+        model = fully_shard(model)
+        sharded_tensor = model.weight
+        sharded_origin_nf4_tensor = distribute_tensor(
+            origin_nf4_tensor,
+            sharded_tensor.device_mesh,
+            sharded_tensor.placements,
+        )
+
+        sharded_nf4_detach = sharded_origin_nf4_tensor.detach()
+        resumed_full_tensor = sharded_nf4_detach.full_tensor()
+
+        self.assertEqual(
+            origin_nf4_tensor.get_original_weight(),
+            resumed_full_tensor.get_original_weight(),
+        )
 
 
 instantiate_parametrized_tests(TestNF4Linear)

@@ -10,45 +10,15 @@ import fire
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.utils.benchmark as benchmark
 from utils import (
-    get_gpu_kernel_gemm_time_s,
+    do_benchmarks,
     get_name_to_shapes_iter,
 )
 
 from torchao.ops import mx_fp4_bf16
 from torchao.prototype.mx_formats.mx_tensor import to_mx
 from torchao.testing.training.roofline_utils import get_specs
-
-
-def benchmark_fn_in_sec(f, *args, **kwargs):
-    # Manual warmup
-    for _ in range(4):
-        f(*args, **kwargs)
-    t0 = benchmark.Timer(
-        stmt="f(*args, **kwargs)", globals={"args": args, "kwargs": kwargs, "f": f}
-    )
-    measurement = t0.blocked_autorange()
-    return measurement.mean
-
-
-def do_benchmarks(
-    tops,
-    peak_tops,
-    use_gpu_kernel_time,
-    f,
-    *args,
-    **kwargs,
-):
-    if use_gpu_kernel_time:
-        # just the gemm GPU kernel
-        time_sec = get_gpu_kernel_gemm_time_s(f, *args, **kwargs)
-    else:
-        # e2e time including kernel launch overhead
-        time_sec = benchmark_fn_in_sec(f, *args, **kwargs)
-    tops_sec = float(tops) / time_sec
-    pct_top_peak = tops_sec / peak_tops
-    return time_sec, tops_sec, pct_top_peak
+from torchao.utils import is_MI300
 
 
 @torch.inference_mode()
@@ -76,7 +46,8 @@ def run(
     specs = get_specs()
     bf16_peak_tops = specs["bf16_peak_tops"]
     fp8_peak_tops = specs["fp8_peak_tops"]
-    fp4_peak_tops = specs["fp4_peak_tops"]
+    fp4_peak_tops = specs.get("fp4_peak_tops", 0.0)  # only on sm120
+    print(f"recipe: {recipe}")
     print(f"gpu_name: {torch.cuda.get_device_name(0)}")
     print(
         f"peak tops: bf16 {bf16_peak_tops:.2e}, fp8 {fp8_peak_tops:.2e}, fp4 {fp4_peak_tops:.2e}"
@@ -87,8 +58,8 @@ def run(
         "M",
         "K",
         "N",
+        "ref_time_s",
         "time_s",
-        "speedup",
         "fp8_speedup",
     )
     results = []
@@ -137,7 +108,10 @@ def run(
         else:
             # raw float8 matmul (upper bound for what we can achive in eager mode)
             # TODO(future): add e5m2
-            d1, d2, d3 = torch.float8_e4m3fn, torch.float8_e4m3fn, dtype
+            e4m3_dtype = torch.float8_e4m3fn
+            if torch.version.hip and torch.cuda.is_available() and is_MI300():
+                e4m3_dtype = torch.float8_e4m3fnuz
+            d1, d2, d3 = e4m3_dtype, e4m3_dtype, dtype
             A = A_hp.to(d1)
             B = B_hp_t.to(d2).contiguous().T
             peak_tops = fp8_peak_tops
@@ -174,6 +148,16 @@ def run(
             nonlocal scale_a
             nonlocal scale_b
             return torch._scaled_mm(A, B, scale_a, scale_b, out_dtype=dtype)
+
+        def do_grouped_mm(A, B):
+            return torch._grouped_mm(A, B, use_fast_accum=fast_accum)
+
+        def do_scaled_grouped_mm(A, B):
+            nonlocal scale_a
+            nonlocal scale_b
+            return torch._scaled_grouped_mm(
+                A, B, scale_a, scale_b, use_fast_accum=fast_accum
+            )
 
         if recipe == "mxfp4_cutlass":
             do_matmul = do_matmul_mxfp4
