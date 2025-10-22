@@ -2739,6 +2739,56 @@ def _register_qlinear_binary_fusion():
                 binary_unary_attr,
             )
 
+def _register_dequant_quant_pass(pattern, pass_number=3, dtype=torch.float32):
+    @register_freezing_graph_pattern(
+        pattern,
+        #extra_check=_is_valid_dequant_promotion_pattern(dtype),
+        pass_number=pass_number,
+    )
+    def dqq(match: Match, *args, **kwargs):
+        assert dtype in [torch.float32, torch.bfloat16]
+        print(match)
+        # if "quantize_per_tensor" not in str(match):
+        #     return
+        # import pdb
+        # pdb.set_trace()
+
+        # Find the start node and end node of a dequant pattern
+        # * End node should be the match.output_node()
+        # * Start node should be the node of dequantize_per_tensor
+        q_pattern_node = match.output_node()
+        dq_pattern_node = q_pattern_node.args[0]
+        cat_node = dq_pattern_node.args[0]
+
+        q_pattern_node.replace_all_uses_with(cat_node)
+        cat_node.meta.update(q_pattern_node.meta)
+
+        match.graph.erase_node(q_pattern_node)
+        match.graph.erase_node(dq_pattern_node)
+
+        counters["inductor"]["dqq_matcher_nodes"] += 1
+        counters["inductor"]["dqq_matcher_nodes"] += len(match.nodes)
+
+def _register_dqq_pattern():
+    dequantize_per_tensor_activation_pattern = CallFunction(
+        quantized_decomposed.dequantize_per_tensor.default,
+        KeywordArg("o_int8"),
+        Arg(),
+        Arg(),
+        Arg(),
+        Arg(),
+        Arg(),
+    )
+    quantized_op_output_pattern_pt2e = CallFunction(
+        quantized_decomposed.quantize_per_tensor.default,
+        dequantize_per_tensor_activation_pattern,
+        KeywordArg("o_inv_scale"),
+        KeywordArg("o_zp"),
+        KeywordArg("o_qmin"),
+        KeywordArg("o_qmax"),
+        KeywordArg("o_dtype"),
+    )
+    _register_dequant_quant_pass(quantized_op_output_pattern_pt2e)
 
 @functools.lru_cache(None)
 def _register_quantization_weight_pack_pass():
@@ -2762,6 +2812,8 @@ def _register_quantization_weight_pack_pass():
         _register_qconv_binary_fusion()
         _register_qlinear_unary_fusion()
         _register_qlinear_binary_fusion()
+
+    _register_dqq_pattern()
 
 
 def quant_lift_up(module_graph: torch.fx.graph.Graph):
